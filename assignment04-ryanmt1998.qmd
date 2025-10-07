@@ -33,20 +33,774 @@ import numpy as np
 
 np.random.seed(42)
 
+# Set Plotly renderer for notebook environments
 pio.renderers.default = "notebook+notebook_connected+vscode"
 
 # Initialize Spark Session
 spark = SparkSession.builder.appName("LightcastData").getOrCreate()
 
 # Load Data
-df = spark.read.option("header", "true").option("inferSchema", "true").option("multiLine","true").option("escape", "\"").csv("./data/lightcast_job_postings.csv")
+df = spark.read.option("header", "true") \
+              .option("inferSchema", "true") \
+              .option("multiLine", "true") \
+              .option("escape", "\"") \
+              .csv("./data/lightcast_job_postings.csv")
 
-# Show Schema and Sample Data
-print("---This is Diagnostic check, No need to print it in the final doc---")
-
-# df.printSchema() # comment this line when rendering the submission
+# Show Schema and Sample Data (for diagnostics, can be commented out in final)
+# df.printSchema()
 df.show(5)
 
 
 
 ```
+
+# Feature Engineering
+
+```{python}
+
+
+
+
+from pyspark.sql.functions import col, pow, when
+from pyspark.ml.feature import StringIndexer, VectorAssembler, OneHotEncoder
+from pyspark.ml import Pipeline
+from pyspark.sql.types import IntegerType, BooleanType, StringType
+
+
+
+# Drop rows with NA values in relevant columns
+df_feature_eng = df.dropna(subset=["SALARY", "MIN_YEARS_EXPERIENCE", "STATE_NAME", "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME", "MIN_EDULEVELS_NAME", "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING"])
+
+
+
+
+eda_cols = ["SALARY", "MIN_YEARS_EXPERIENCE", "DURATION", "COMPANY_IS_STAFFING", "IS_INTERNSHIP", "STATE_NAME", "REMOTE_TYPE_NAME", "EMPLOYMENT_TYPE_NAME", "MIN_EDULEVELS_NAME"]
+
+
+df_feature_eng = df_feature_eng.select(eda_cols)
+
+
+#Clean categorical variable REMOTE_TYPE_NAME
+df_feature_eng = df_feature_eng.withColumn(
+    "REMOTE_TYPE_NAME",
+    when(col("REMOTE_TYPE_NAME") == "Remote", "Remote")
+    .when(col("REMOTE_TYPE_NAME") == "[None]", "Undefined")
+    .when(col("REMOTE_TYPE_NAME") == "Not Remote", "On Premise")
+    .when(col("REMOTE_TYPE_NAME") == "Hybrid Remote", "Hybrid")
+    .when(col("REMOTE_TYPE_NAME").isNull(), "On Premise")
+    .otherwise(col("REMOTE_TYPE_NAME"))
+)
+
+
+
+#Clean categorical variable EMPLOYMENT_TYPE_NAME
+df_feature_eng = df_feature_eng.withColumn(
+    "EMPLOYMENT_TYPE_NAME",
+    when(col("EMPLOYMENT_TYPE_NAME") == "Part-time / full-time", "Flexible")
+    .when(col("EMPLOYMENT_TYPE_NAME") == "Part-time (â‰¤ 32 hours)", "Parttime")
+    .when(col("EMPLOYMENT_TYPE_NAME") == "Full-time (> 32 hours)", "Fulltime")
+    .when(col("EMPLOYMENT_TYPE_NAME").isNull(), "Fulltime")
+    .otherwise(col("EMPLOYMENT_TYPE_NAME"))
+)
+
+
+# Categorical columns
+categorical_cols = ["EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME"]
+
+# continuous columns
+continuous_cols = ["MIN_YEARS_EXPERIENCE", "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING"]
+
+# Setup pipeline stages for indexing and encoding categorical columns
+indexers = [StringIndexer(inputCol=col, outputCol=f"{col}_Idx", handleInvalid="skip") for col in categorical_cols]
+encoders = [OneHotEncoder(inputCol=f"{col}_Idx", outputCol=f"{col}_vec") for col in categorical_cols]
+
+
+
+
+
+```
+
+
+```{python}
+assembler = VectorAssembler(
+inputCols=["MIN_YEARS_EXPERIENCE", "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING"] + [f"{col}_vec" for col in categorical_cols], outputCol="features"
+)
+
+
+# Build Pipeline and Transform
+pipeline = Pipeline(stages=indexers + encoders + [assembler])
+data = pipeline.fit(df_feature_eng).transform(df_feature_eng)
+
+
+# Create squared term for Polynomial Regression
+data = data.withColumn("MIN_YEARS_EXPERIENCE_SQ", pow(col("MIN_YEARS_EXPERIENCE"), 2))
+
+# Assemble Polynomial Features
+assembler_poly = VectorAssembler(
+inputCols=[ "MIN_YEARS_EXPERIENCE", "MIN_YEARS_EXPERIENCE_SQ", "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING"] + [f"{col}_vec" for col in categorical_cols], outputCol="features_poly"
+)
+data = assembler_poly.transform(data)
+
+
+# Split Data
+regression_train, regression_test = data.randomSplit([0.8, 0.2], seed=42)
+
+
+# Show final structure
+data.select("SALARY", "features", "features_poly").show(5, truncate=False)
+
+
+
+
+
+```
+
+
+```
++------+--------------------------------------+-------------------------------------------+
+|SALARY|features                              |features_poly                              |
++------+--------------------------------------+-------------------------------------------+
+|192800|(9,[0,1,4,6],[6.0,55.0,1.0,1.0])      |(10,[0,1,2,5,7],[6.0,36.0,55.0,1.0,1.0])   |
+|125900|(9,[0,1,4,6],[12.0,18.0,1.0,1.0])     |(10,[0,1,2,5,7],[12.0,144.0,18.0,1.0,1.0]) |
+|118560|[5.0,20.0,0.0,1.0,1.0,0.0,0.0,1.0,0.0]|[5.0,25.0,20.0,0.0,1.0,1.0,0.0,0.0,1.0,0.0]|
+|192800|(9,[0,1,4,6],[6.0,55.0,1.0,1.0])      |(10,[0,1,2,5,7],[6.0,36.0,55.0,1.0,1.0])   |
+|116500|(9,[0,1,4,6],[12.0,16.0,1.0,1.0])     |(10,[0,1,2,5,7],[12.0,144.0,16.0,1.0,1.0]) |
++------+--------------------------------------+-------------------------------------------+
+only showing top 5 rows
+```
+
+My final structure has been created using features and polynomial features from the original dataset. I used an 80-20 training test split. I also used a random state of 42. I believe that an 80% training set provides a sufficient amount of data for the model to learn from, especially since our polynomial and random forest models require a large dataset to learn from. The other 20% is sufficiently large to provide a reliable estimate of model performance.
+
+# Linear Regression
+
+```{python}
+
+from pyspark.ml.regression import LinearRegression
+
+# Creating Linear Regression Model
+lr = LinearRegression(featuresCol="features", labelCol="SALARY")
+
+# training the model
+lr_model = lr.fit(regression_train)
+
+
+
+
+```
+
+```{python}
+
+# Making predictions
+predictions = lr_model.transform(regression_test)
+
+# Evaluate the model
+from pyspark.ml.evaluation import RegressionEvaluator
+
+evaluator_r2 = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="r2")
+evaluator_rmse = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="rmse")
+evaluator_mae = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="mae")
+
+r2 = evaluator_r2.evaluate(predictions)
+rmse = evaluator_rmse.evaluate(predictions)
+mae = evaluator_mae.evaluate(predictions)
+
+print(f"R²: {r2}")
+print(f"RMSE: {rmse}")
+print(f"MAE: {mae}")    
+
+# Print coefficients and intercept
+print("Coefficients:", lr_model.coefficients)
+print("Intercept:", lr_model.intercept)
+
+
+
+
+```
+
+```
+[Stage 23:>                                                         (0 + 1) / 1]
+R²: 0.27747505372039105
+RMSE: 35354.21968106297
+MAE: 27394.263039528487
+Coefficients: [6831.19516740728,-16.944672967567364,-8335.0742639915,455.51244715909286,-1261.5274637185041,-3264.749623577828,7407.370489759505,8150.657530209268,22412.845022831403]
+Intercept: 76301.15556556016
+
+
+```
+
+```{python}
+
+import pandas as pd
+from scipy.stats import t
+
+summary = lr_model.summary
+coefficients = lr_model.coefficients
+intercept = lr_model.intercept
+std_errors = summary.coefficientStandardErrors
+t_values = summary.tValues
+p_values = summary.pValues
+
+# Calculate degrees of freedom
+n = summary.numInstances
+p = len(coefficients)
+dof = n - p - 1
+
+# Critical t-value for 95% confidence interval (two-tailed)
+critical_value = t.ppf(0.975, dof)
+
+
+
+# Create DataFrame
+coef_df = pd.DataFrame({
+    "Feature": ["Intercept"] + [f"Feature_{i}" for i in range(p)],
+    "Coefficient": [intercept] + coefficients.tolist(),
+    "Std Error": std_errors,
+    "t-value": t_values,
+    "p-value": p_values
+})
+
+# Calculate confidence intervals
+coef_df["95% CI Lower"] = coef_df["Coefficient"] - critical_value * coef_df["Std Error"]
+coef_df["95% CI Upper"] = coef_df["Coefficient"] + critical_value * coef_df["Std Error"]
+
+print(coef_df)
+
+
+
+
+```
+
+```{python}
+
+feature_names = [
+    "MIN_YEARS_EXPERIENCE",
+    "DURATION",
+    "IS_INTERNSHIP",
+    "COMPANY_IS_STAFFING",
+    # Add your categorical feature dummy variable names here, e.g.:
+    "EMPLOYMENT_TYPE_NAME_A",
+    "EMPLOYMENT_TYPE_NAME_B",
+    "REMOTE_TYPE_NAME_X",
+    "REMOTE_TYPE_NAME_Y",
+    "REMOTE_TYPE_NAME_Z"
+]
+
+coef_df = pd.DataFrame({
+    "Feature": ["Intercept"] + feature_names,
+    "Coefficient": [intercept] + coefficients.tolist(),
+    "Std Error": std_errors,
+    "t-value": t_values,
+    "p-value": p_values
+})
+
+# Calculate confidence intervals
+coef_df["95% CI Lower"] = coef_df["Coefficient"] - critical_value * coef_df["Std Error"]
+coef_df["95% CI Upper"] = coef_df["Coefficient"] + critical_value * coef_df["Std Error"]
+
+print(coef_df)
+
+
+
+
+```
+
+The linear regression model has a coefficient of determination (R²) of 0.2775, which means that about 27.75% of the variance in the salary data can be explained by our model's features. The R² tells us that while our model captures some of the underlying patterns in the data, there are still many factors affecting salary that our model does not account for. Additionally, the root mean squared error (RMSE) of the model is 35,354, which indicates that, on average, our model's salary predictions deviate from the actual salary by about $35,354. The mean absolute error (MAE) is 27,394, meaning that on average, our predictions for this model are off by about $27,394. Using the summary feature, we can look at the coefficients, standard errors, t-values, p-values, and confidence intervals of our features. The intercept is 76301.15, with a p-value of 0.000, highlighting that it is statistically significant. The MIN_YEARS_EXPERIENCE feature has a coefficient of 6831, but a high p-value of 0.47, indicating that it is not significant. Duration has a negative coefficient of -16.9, with a p-value of 0.22, so its not significant either. Additionally, IS_INTERNSHIP and COMPANY_IS_STAFFING are not significant. EMPLOYMENT_TYPE_NAME_B has a negative coefficient of -3264 with a p-value of 0.0024, so it has a negative impact. REMOTE_TYPE_NAME for X, Y, and Z are all significant, with Z having the largest, positive affect.
+
+```
+Feature   Coefficient    Std Error    t-value       p-value  \
+0               Intercept  76301.155566   102.177226  66.856338  0.000000e+00   
+1    MIN_YEARS_EXPERIENCE   6831.195167    23.498093  -0.721108  4.708573e-01   
+2                DURATION    -16.944673  6746.455365  -1.235475  2.166790e-01   
+3           IS_INTERNSHIP  -8335.074264  1058.463112   0.430353  6.669471e-01   
+4     COMPANY_IS_STAFFING    455.512447  2985.376196  -0.422569  6.726176e-01   
+5  EMPLOYMENT_TYPE_NAME_A  -1261.527464  3602.352700  -0.906283  3.648051e-01   
+6  EMPLOYMENT_TYPE_NAME_B  -3264.749624  2427.654733   3.051245  2.284094e-03   
+7      REMOTE_TYPE_NAME_X   7407.370490  2493.856758   3.268294  1.085129e-03   
+8      REMOTE_TYPE_NAME_Y   8150.657530  3132.647036   7.154603  8.897327e-13   
+9      REMOTE_TYPE_NAME_Z  22412.845023  3524.083191  21.651349  0.000000e+00   
+
+   95% CI Lower  95% CI Upper  
+0  76100.870974  76501.440157  
+1   6785.134943   6877.255392  
+2 -13241.134758  13207.245412  
+3 -10409.840439  -6260.308089  
+4  -5396.328284   6307.353179  
+5  -8322.746176   5799.691249  
+6  -8023.362245   1493.862998  
+7   2518.990736  12295.750244  
+8   2010.141121  14291.173939  
+9  15505.047746  29320.642300
+
+
+```
+
+# Polynomial Regression
+
+
+```
+[Stage 28:>                                                         (0 + 1) / 1]
+R²: 0.2999111042236341
+RMSE: 34800.97629236496
+MAE: 26815.734743406734
+Coefficients: [12321.424633194574,-410.81806941944365,-16.033371304985252,-4816.276067454366,-122.15434444725373,-4962.654169742263,-6422.5061156546435,6702.637628410731,7601.6311647419425,20955.03322404107]
+Intercept: 67481.20783767497
+
+```
+```{python}
+
+from pyspark.ml.regression import LinearRegression
+
+# Creating Polynomial Regression Model
+lr_poly = LinearRegression(featuresCol="features_poly", labelCol="SALARY")
+
+
+#training the model
+lr_poly_model = lr_poly.fit(regression_train)
+
+
+
+
+
+
+```
+
+```{python}
+
+# Making Predictions
+predictions_poly = lr_poly_model.transform(regression_test)
+
+# Evaluate the Polynomial model
+evaluator_r2_poly = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="r2")
+evaluator_rmse_poly = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="rmse")
+evaluator_mae_poly = RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName="mae")
+
+r2_poly = evaluator_r2_poly.evaluate(predictions_poly)
+rmse_poly = evaluator_rmse_poly.evaluate(predictions_poly)
+mae_poly = evaluator_mae_poly.evaluate(predictions_poly)
+
+print(f"R²: {r2_poly}")
+print(f"RMSE: {rmse_poly}")
+print(f"MAE: {mae_poly}")
+
+# Print coefficients and intercept for Polynomial Regression
+print("Coefficients:", lr_poly_model.coefficients)
+print("Intercept:", lr_poly_model.intercept)
+
+
+
+
+```
+
+```{python}
+
+import pandas as pd
+from scipy.stats import t
+
+summary_poly = lr_poly_model.summary
+coefficients_poly = lr_poly_model.coefficients
+intercept_poly = lr_poly_model.intercept
+std_errors_poly = summary_poly.coefficientStandardErrors
+t_values_poly = summary_poly.tValues
+p_values_poly = summary_poly.pValues
+
+# Calculate degrees of freedom
+n_poly = summary_poly.numInstances
+p_poly = len(coefficients_poly)
+dof_poly = n_poly - p_poly - 1
+
+# Critical t-value for 95% confidence interval (two-tailed)
+critical_value_poly = t.ppf(0.975, dof_poly)
+
+
+
+# Create DataFrame
+coef_poly_df = pd.DataFrame({
+    "Feature": ["Intercept"] + [f"Feature_{i}" for i in range(p_poly)],
+    "Coefficient": [intercept_poly] + coefficients_poly.tolist(),
+    "Std Error": std_errors_poly,
+    "t-value": t_values_poly,
+    "p-value": p_values_poly
+})
+
+# Calculate confidence intervals
+coef_poly_df["95% CI Lower"] = coef_poly_df["Coefficient"] - critical_value_poly * coef_poly_df["Std Error"]
+coef_poly_df["95% CI Upper"] = coef_poly_df["Coefficient"] + critical_value_poly * coef_poly_df["Std Error"]    
+
+print(coef_poly_df)
+
+
+
+
+```
+
+```{python}
+
+feature_names_poly = [
+    "MIN_YEARS_EXPERIENCE",
+    "MIN_YEARS_EXPERIENCE_SQ",
+    "DURATION",
+    "IS_INTERNSHIP",
+    "COMPANY_IS_STAFFING",
+    # For categorical column EMPLOYMENT_TYPE_NAME_vec, list categories manually
+    "EMPLOYMENT_TYPE_NAME_A",  # replace _A with actual category name
+    "EMPLOYMENT_TYPE_NAME_B",
+    # For categorical column REMOTE_TYPE_NAME_vec, list categories manually
+    "REMOTE_TYPE_NAME_X",
+    "REMOTE_TYPE_NAME_Y",
+    "REMOTE_TYPE_NAME_Z"
+]
+
+# Then build your DataFrame as before:
+coef_poly_df = pd.DataFrame({
+    "Feature": ["Intercept"] + feature_names_poly,
+    "Coefficient": [intercept_poly] + coefficients_poly.tolist(),
+    "Std Error": std_errors_poly,
+    "t-value": t_values_poly,
+    "p-value": p_values_poly
+})
+
+# Calculate confidence intervals
+coef_poly_df["95% CI Lower"] = coef_poly_df["Coefficient"] - critical_value_poly * coef_poly_df["Std Error"]
+coef_poly_df["95% CI Upper"] = coef_poly_df["Coefficient"] + critical_value_poly * coef_poly_df["Std Error"]
+
+print(coef_poly_df)
+
+
+
+
+```
+
+The polynomial regression model has a coefficient of determination (R²) of 0.2999, meaning the model explains about 29.99% of variation in the salary data, which is a slight improvement over the linear regression model. The root mean squared error (RMSE) is 34,801, so the model predictions deviate from the actual salaries by about $34,801 on average. The mean absolute error (MAE) is 26,816 or $26,816, which is an improvement over the linear regression model as well. Using the summary feature, we can see the intercept is 67,481 with a p-value near 0.00, making it highly significant. The MIN_YEARS_EXPERIENCE feature has a coefficient of 12,321 and a p-value close to 0.00, indicating that it has a positive impact on salary. The quadratic term for MIN_YEARS_EXPERIENCE has a negative coefficient of -410.82, but does not have a significant impact based on its p-value of 0.49. We can conclude that DURATION, IS_INTERNSHIP, COMPANY_IS_STAFFING, and EMPLOYMENT_TYPE_NAME_A are not significant, as their p-values are all above 0.05. We can also see that EMPLOYMENT_TYPE_NAME_B has a negative coefficient of -6,422 and a p-value of 0.0053, indicating that it has a negative impact on salary. REMOTE_TYPE_NAME_X, Y, and Z are all significant, with Z having the largest positive impact. This model improves on the linear regression model by capturing years of experience as an impact on salary, but it still does not capture a large portion of the variance in the data.
+
+
+```
+Feature   Coefficient    Std Error    t-value  \
+0                 Intercept  67481.207838   363.827753  33.866093   
+1      MIN_YEARS_EXPERIENCE  12321.424633    26.151749 -15.709009   
+2   MIN_YEARS_EXPERIENCE_SQ   -410.818069    23.252997  -0.689518   
+3                  DURATION    -16.033371  6679.822656  -0.721019   
+4             IS_INTERNSHIP  -4816.276067  1048.064896  -0.116552   
+5       COMPANY_IS_STAFFING   -122.154344  2963.608208  -1.674531   
+6    EMPLOYMENT_TYPE_NAME_A  -4962.654170  3570.430449  -1.798804   
+7    EMPLOYMENT_TYPE_NAME_B  -6422.506116  2402.744508   2.789576   
+8        REMOTE_TYPE_NAME_X   6702.637628  2468.084436   3.079972   
+9        REMOTE_TYPE_NAME_Y   7601.631165  3101.351134   6.756743   
+10       REMOTE_TYPE_NAME_Z  20955.033224  3532.222708  19.104460   
+
+         p-value  95% CI Lower  95% CI Upper  
+0   0.000000e+00  66768.044088  68194.371588  
+1   0.000000e+00  12270.162795  12372.686472  
+2   4.905108e-01   -456.397864   -365.238275  
+3   4.709126e-01 -13109.612230  13077.545488  
+4   9.072169e-01  -6870.660004  -2761.892131  
+5   9.405324e-02  -5931.326202   5687.017513  
+6   7.207562e-02 -11961.299950   2035.991611  
+7   5.286330e-03 -11132.290539  -1712.721693  
+8   2.075044e-03   1864.775927  11540.499329  
+9   1.478861e-11   1522.459945  13680.802384  
+10  0.000000e+00  14031.281059  27878.785389
+
+
+
+
+```
+
+# Random Forest Regressor
+```{python}
+
+from pyspark.ml.regression import RandomForestRegressor
+
+# choose hyperparameters 
+num_trees = 400
+max_depth = 8
+
+
+# Initialize Random Forest Regressor
+rf = RandomForestRegressor(featuresCol="features", labelCol="SALARY", numTrees =num_trees, maxDepth=max_depth, seed=42)
+
+# Fit the model
+rf_model = rf.fit(regression_train)
+
+# Optionally evaluate on test data
+predictions_rf = rf_model.transform(regression_test)
+predictions_rf.select("SALARY", "prediction").show(5)
+
+print("Feature Importances:", rf_model.featureImportances
+)
+
+
+
+
+```
+
+```{python}
+
+# Feature Importance Plot
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+importances = rf_model.featureImportances.toArray()
+
+feat_importance_df = pd.DataFrame({
+    "Feature": feature_names,
+    "Importance": importances
+})
+
+feat_imp_df = feat_importance_df.sort_values(by="Importance", ascending=False).head(10)
+
+# Making the plot
+plt.figure(figsize=(10, 6))
+sns.barplot(x='Importance', y='Feature', data=feat_imp_df, palette='viridis')
+plt.title("Top 10 Feature Importances from Random Forest Model")
+plt.xlabel("Importance")
+plt.ylabel("Feature")
+plt.tight_layout()
+plt.savefig('output/rf_feature_importance.png')
+plt.show()
+
+
+
+
+
+
+
+```
+
+![](output/rf_feature_importance.png)
+
+Our random forest regression model has several features and by creating a bar plot we can identify which features are the most important in predicting salary. The bar plot shows that MIN_YEARS_EXPERIENCE is the most important feature, with an importance score of over 0.8. The next most important feature is DURATION, with a importance score of over 0.1, significantly lower than MIN_YEARS_EXPERIENCE. The other features, such REMOTE_TYPE_NAME_Z, X, and Y, EMPLOYMENT_TYPE_NAME_A, COMPANY_IS_STAFFING, EMPLOYMENT_TYPE_NAME_B, and IS_INTERNSHIP are significantly less important, with importance scores close to 0. 
+
+# Compare 3 Models – GLR, Polynomial, RF
+
+```{python}
+
+from pyspark.sql.functions import monotonically_increasing_id
+
+# Add unique row ID to original data
+data_indexed = data.withColumn("row_id", monotonically_increasing_id())
+
+# Generate predictions from each model, keeping row_id and relevant columns
+predictions_lr = lr_model.transform(data_indexed) \
+    .withColumnRenamed("prediction", "LR_Prediction") \
+    .select("row_id", "SALARY", "LR_Prediction")
+
+predictions_poly = lr_poly_model.transform(data_indexed) \
+    .withColumnRenamed("prediction", "Poly_Prediction") \
+    .select("row_id", "Poly_Prediction")
+
+predictions_rf = rf_model.transform(data_indexed) \
+    .withColumnRenamed("prediction", "RF_Prediction") \
+    .select("row_id", "RF_Prediction")
+
+# Join all predictions on row_id
+combined_predictions = predictions_lr \
+    .join(predictions_poly, on="row_id") \
+    .join(predictions_rf, on="row_id") \
+    .select("SALARY", "LR_Prediction", "Poly_Prediction", "RF_Prediction")
+
+combined_predictions.show(5)
+
+
+
+
+
+
+```
+```
++------+------------------+------------------+------------------+
+|SALARY|     LR_Prediction|   Poly_Prediction|     RF_Prediction|
++------+------------------+------------------+------------------+
+|192800|122502.21258282862|127478.45317463673| 150419.0700588687|
+|125900| 164116.3364870723|157631.88421478868|142783.37872342562|
+|118560|117462.88045689506|121014.03449261448|122520.02802832137|
+|192800|122502.21258282862|127478.45317463673| 150419.0700588687|
+|116500|164150.22583300743| 157663.9509573987|142117.03903479254|
++------+------------------+------------------+------------------+
+```
+
+The combines predictions for linear, polynomial, and random forest regression models highlight that the random forest model tends to be closer to actual salaries for higher values. The polynomial regression model performs slightly better than the linear regression model. The linear regression model seemingly underestimates salaries in some cases. 
+
+```{python}
+
+# A 2x2 grid plot comparing the actual vs. predicted values for each model.
+# Use seaborn
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+
+
+# Pandas
+preds_pd = combined_predictions.toPandas()
+
+# Common Axis Limits 
+min_val = preds_pd["SALARY"].min()
+max_val = preds_pd["SALARY"].max()
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+
+#plot linear regression
+sns.scatterplot(ax=axes[0, 0], x="SALARY", y="LR_Prediction", data=preds_pd, alpha=0.5)
+axes[0, 0].plot([min_val, max_val], [min_val, max_val], 'r--')
+axes[0, 0].set_title("Linear Regression: Actual vs Predicted Salary")
+axes[0, 0].set_xlim(min_val, max_val)
+axes[0, 0].set_ylim(min_val, max_val)
+
+#plot polynomial regression
+sns.scatterplot(ax=axes[0, 1], x="SALARY", y="Poly_Prediction", data=preds_pd, alpha=0.5)
+axes[0, 1].plot([min_val, max_val], [min_val, max_val], 'r--')
+axes[0, 1].set_title("Polynomial Regression: Actual vs Predicted Salary")
+axes[0, 1].set_xlim(min_val, max_val)
+axes[0, 1].set_ylim(min_val, max_val)   
+
+#plot random forest
+sns.scatterplot(ax=axes[1, 0], x="SALARY", y="RF_Prediction", data=preds_pd, alpha=0.5)
+axes[1, 0].plot([min_val, max_val], [min_val, max_val], 'r--')
+axes[1, 0].set_title("Random Forest: Actual vs Predicted Salary")
+axes[1, 0].set_xlim(min_val, max_val)
+axes[1, 0].set_ylim(min_val, max_val)       
+
+#Hide unused subplot
+axes[1, 1].axis('off')
+
+plt.tight_layout()
+plt.savefig('output/model_Predictions_V_Actuals_For_Each_Model.png')
+plt.show()
+
+
+
+
+```
+
+![](output/model_Predictions_V_Actuals_For_Each_Model.png)
+
+The three graphs comparing actual salaries to predicted salaries for each model show that all of the models tend to under-predict higher salaries, which indicates that the models are missing features that would help them better predict higher salaries. The random forest regression model appears to outperform the other two models, by producing predictions that are closer to actual salaries with less scatter. The linear and polynomial regression models are incredibly similar, but the latter appears to perform slightly better with a somewhat tighter clustering of points around the prediction line. The graphs are consistent with the metrics, such as log likelihood, RMSE, and MAE, which also indicate that the random forest regression model is the best of the three models.
+
+```{python}
+# Calculating RMSE for each model
+from pyspark.ml.evaluation import RegressionEvaluator
+evaluator = RegressionEvaluator(labelCol="SALARY", metricName="rmse")
+rmse_lr = evaluator.evaluate(combined_predictions.withColumnRenamed("LR_Prediction", "prediction"))
+rmse_poly = evaluator.evaluate(combined_predictions.withColumnRenamed("Poly_Prediction", "prediction"))
+rmse_rf = evaluator.evaluate(combined_predictions.withColumnRenamed("RF_Prediction", "prediction"))
+print(f"RMSE - Linear Regression: {rmse_lr}")
+print(f"RMSE - Polynomial Regression: {rmse_poly}")
+print(f"RMSE - Random Forest: {rmse_rf}")   
+
+
+```
+
+
+```
+RMSE - Linear Regression: 36023.3148101222
+RMSE - Polynomial Regression: 35610.993411374555
+RMSE - Random Forest: 33516.18792099613
+
+```
+By having the lowest of RMSE of 33,516.19, the random forest regression model predicts salaries more accurately on average. The polynomial regression model has an RMSE of 35,610.99, which is better than the linear regression model's RMSE of 36,023.31. The polynomial regression model is better at predicting salaries than the linear regression model, but the random forest regression model is the best of the three.
+
+```{python}
+
+# AIC for each model 
+
+
+# Linear regression model AIC 
+import math
+n = regression_test.count()
+p = len(lr_model.coefficients)
+rss_lr = lr_model.summary.meanSquaredError * n
+aic_lr = n * math.log(rss_lr / n) + 2 * p
+print(f"AIC - Linear Regression: {aic_lr}")
+
+# polynomial regression model AIC 
+n_poly = regression_test.count()
+p_poly = len(lr_poly_model.coefficients)
+rss_poly = lr_poly_model.summary.meanSquaredError * n_poly
+aic_poly = n_poly * math.log(rss_poly / n_poly) + 2 * p_poly
+print(f"AIC - Polynomial Regression: {aic_poly}")   
+
+
+
+
+
+
+```
+
+
+```
+AIC - Linear Regression: 59049.53483773521
+[Stage 67:>                                                         (0 + 1) / 1]
+AIC - Polynomial Regression: 58992.30571886943
+
+```
+The AIC for the linear regression model is 59,049.53 is greater than the AIC for the polynomial regression model of 58,992.31. This indicates that the polynomial regression model provides a better fit to the data compared to the linear regression model, while also handling the complexity of the data better. 
+
+```{python}
+
+# Calculating Log likelihood Pyspark Models
+import math
+
+# Log Likelihood for Linear Regression
+n = combined_predictions.count()
+rss_lr = combined_predictions.withColumn("squared_error", (col("SALARY") - col("LR_Prediction"))**2).groupBy().sum("squared_error").collect()[0][0]
+ll_lr = -n/2 * (math.log(2 * math.pi) + 1 - math.log(n) + math.log(rss_lr)) 
+
+# Log Likelihood for Polynomial Regression
+rss_poly = combined_predictions.withColumn("squared_error", (col("SALARY") - col("Poly_Prediction"))**2).groupBy().sum("squared_error").collect()[0][0]
+ll_poly = -n/2 * (math.log(2 * math.pi) + 1 - math.log(n) + math.log(rss_poly))
+
+# Log Likelihood for Random Forest
+rss_rf = combined_predictions.withColumn("squared_error", (col("SALARY") - col("RF_Prediction"))**2).groupBy().sum("squared_error").collect()[0][0]
+ll_rf = -n/2 * (math.log(2 * math.pi) + 1 - math.log(n) + math.log(rss_rf)) 
+
+print(f"Log Likelihood - Linear Regression: {ll_lr}")
+print(f"Log Likelihood - Polynomial Regression: {ll_poly}")
+print(f"Log Likelihood - Random Forest: {ll_rf}")       
+
+
+
+
+```
+
+```
+[Stage 85:>                                                         (0 + 1) / 1]
+Log Likelihood - Linear Regression: -171706.96027751334
+Log Likelihood - Polynomial Regression: -171541.0037386337
+Log Likelihood - Random Forest: -170667.02148159023
+```
+
+Higher log likelihood values indicate a better fit to the data. The random forest got a value of -171,706.96, once again showing that it is the best model of the three. The polynomial regression model has a log likelihood of -171,541, which is better than the linear regression model's log likelihood of -170,667.02. 
+
+```{python}
+
+# Calculating BIC for each model
+
+#BIC for Linear Regression
+k_lr = len(lr_model.coefficients) + 1  # number of parameters (coefficients + intercept)
+bic_lr = -2 * ll_lr + k_lr * math.log(n)
+
+#BIC for Polynomial Regression
+k_poly = len(lr_poly_model.coefficients) + 1            
+bic_poly = -2 * ll_poly + k_poly * math.log(n)
+
+#BIC for Random Forest
+k_rf = num_trees * max_depth  # approximate number of parameters
+bic_rf = -2 * ll_rf + k_rf * math.log(n)        
+
+print(f"BIC - Linear Regression: {bic_lr}")
+print(f"BIC - Polynomial Regression: {bic_poly}")
+print(f"BIC - Random Forest: {bic_rf}") 
+
+
+
+
+```
+
+```
+BIC - Linear Regression: 343509.68149482517
+BIC - Polynomial Regression: 343187.3445110457
+BIC - Random Forest: 371977.54369869444
+```
+
+The random forest regression model has the highest BIC score of 371,977.54, making it the least preferred based on this criterion, but that is because of the complexity of the model. The polynomial regression model has a BIC score of 343,187.34, which is less than the linear regression model's BIC score of 343,509.68. Based on this criteria, the polynomial regression model is preferred over the linear regression model and the random forest regression model. 
