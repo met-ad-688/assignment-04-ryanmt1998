@@ -24,6 +24,11 @@ execute:
   freeze: auto
 ---
 
+Generative AI Disclaimer: AI was used to assist with organzing and arranging data pipelines to perform models.
+
+Github Repository Link: https://github.com/met-ad-688/assignment-04-ryanmt1998.git
+
+
 ```{python}
 from pyspark.sql import SparkSession
 import pandas as pd
